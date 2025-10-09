@@ -51,11 +51,11 @@ def make_dataset(root, subset) -> list[tuple[Path, Path | None]]:
 
 class SliceDataset(Dataset):
     def __init__(self, subset, root_dir, img_transform=None,
-                 gt_transform=None, augment=False, equalize=False, debug=False):
+                 gt_transform=None, augmentations=None, equalize=False, debug=False):
         self.root_dir: str = root_dir
         self.img_transform: Callable = img_transform
         self.gt_transform: Callable = gt_transform
-        self.augmentation: bool = augment
+        self.augmentations: List[Callable] = augmentations if augmentations is not None else []
         self.equalize: bool = equalize
 
         self.test_mode: bool = subset == 'test'
@@ -64,26 +64,49 @@ class SliceDataset(Dataset):
         if debug:
             self.files = self.files[:10]
 
+        self.variants_per = 1 + (0 if self.test_mode else len(self.augmentations))
+        if self.test_mode:  # no augs in test mode
+            self.variants_per = 1
+
         print(f">> Created {subset} dataset with {len(self)} images...")
 
     def __len__(self):
-        return len(self.files)
+        return len(self.files) * self.variants_per
+
+    def _map_index(self, index):
+        base_idx = index // self.variants_per
+        variant_id = index % self.variants_per
+        return base_idx, variant_id
 
     def __getitem__(self, index) -> dict[str, Union[Tensor, int, str]]:
-        img_path, gt_path = self.files[index]
+        base_idx, variant_id = self._map_index(index)
+        img_path, gt_path = self.files[base_idx]
 
-        img: Tensor = self.img_transform(Image.open(img_path))
+        img_pil = Image.open(img_path)
 
-        data_dict = {"images": img,
-                     "stems": img_path.stem}
+        data_dict = {"stems": img_path.stem}
 
-        if not self.test_mode:
-            gt: Tensor = self.gt_transform(Image.open(gt_path))
+        if self.test_mode:
+            data_dict["images"] = self.img_transform(img_pil)
+            return data_dict
 
-            _, W, H = img.shape
-            K, _, _ = gt.shape
-            assert gt.shape == (K, W, H)
+        gt_pil = Image.open(gt_path)
 
-            data_dict["gts"] = gt
+        if variant_id == 0:
+            img, gt = img_pil, gt_pil
+        else:
+            offset = 1
+            aug_idx = variant_id - offset
+            img, gt = self.augmentations[aug_idx](img_pil.copy(), gt_pil.copy())
+
+        img: Tensor = self.img_transform(img)
+        gt: Tensor = self.gt_transform(gt)
+
+        _, W, H = img.shape
+        K, _, _ = gt.shape
+        assert gt.shape == (K, W, H)
+
+        data_dict["gts"] = gt
+        data_dict["images"] = img
 
         return data_dict
