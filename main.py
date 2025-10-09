@@ -57,6 +57,8 @@ from utils import (Dcm,
                    save_images)
 from losses import CrossEntropy
 
+from data_augmentation import HFlip, VFlip, Rotate, RandomAffine
+
 datasets_params: dict[str, dict[str, Any]] = {}
 # K for the number of classes
 # Avoids the classes with C (often used for the number of Channel)
@@ -81,6 +83,26 @@ def gt_transform(K, img):
     img = torch.tensor(img, dtype=torch.int64)[None, ...]  # Add one dimension to simulate batch
     img = class2one_hot(img, K=K)
     return img[0]
+
+
+# -------------------- Data Augmentation --------------------
+def build_augmentations(args):
+    norm = lambda s: s.lower()
+    tokens = [norm(s) for s in args.augmentations]
+
+    augs = []
+    for t in tokens:
+        if t == 'hflip':
+            augs.append(HFlip())
+        elif t == 'vflip':
+            augs.append(VFlip())
+        elif t == 'rotate':
+            augs.append(Rotate())
+        elif t == 'affine':
+            augs.append(RandomAffine())
+        else:
+            raise ValueError(f"Unknown augmentation: {t}")
+    return augs
 
 
 # -------------------- add K-Fold splits --------------------
@@ -170,6 +192,7 @@ def setup(args) -> tuple[nn.Module, Any, Any, DataLoader, DataLoader, int]:
                              root_dir,
                              img_transform=img_transform,
                              gt_transform= partial(gt_transform, K),
+                             augmentations=build_augmentations(args),
                              debug=args.debug)
     train_loader = DataLoader(train_set,
                               batch_size=B,
@@ -357,6 +380,9 @@ def main():
          "If a directory is given, the file will be named {num_folds}_folds.pkl.")
     parser.add_argument('--fold_index', type=int, default=None,
                     help="If set (1-based), train only this fold instead of all folds.")
+    parser.add_argument('--augmentations', nargs='*', default=[],
+                        help="List of data augmentation to use during training. "
+                             "Available: HFlip, VFlip, Rotate, Affine.")
 
     args = parser.parse_args()
 
