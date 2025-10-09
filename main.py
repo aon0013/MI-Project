@@ -35,6 +35,7 @@ import shutil
 import re
 
 
+import random
 import torch
 import numpy as np
 import torch.nn.functional as F
@@ -58,6 +59,20 @@ from utils import (Dcm,
 from losses import CrossEntropy
 
 from data_augmentation import HFlip, VFlip, Rotate, RandomAffine
+
+def set_seed(seed: int = 42):
+    random.seed(seed)
+    np.random.seed(seed)
+
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    torch.backends.cudnn.deterministic = True
+
+def worker_init_fn(worker_id):
+    seed = torch.initial_seed() % 2**32
+    np.random.seed(seed)
+    random.seed(seed)  
 
 datasets_params: dict[str, dict[str, Any]] = {}
 # K for the number of classes
@@ -188,6 +203,9 @@ def setup(args) -> tuple[nn.Module, Any, Any, DataLoader, DataLoader, int]:
     B: int = datasets_params[args.dataset]['B']
     root_dir = args.dest
 
+    g = torch.Generator()
+    g.manual_seed(args.seed)
+
     train_set = SliceDataset('train',
                              root_dir,
                              img_transform=img_transform,
@@ -197,6 +215,7 @@ def setup(args) -> tuple[nn.Module, Any, Any, DataLoader, DataLoader, int]:
     train_loader = DataLoader(train_set,
                               batch_size=B,
                               num_workers=5,
+                              worker_init_fn=worker_init_fn,
                               shuffle=True)
 
     val_set = SliceDataset('val',
@@ -207,6 +226,7 @@ def setup(args) -> tuple[nn.Module, Any, Any, DataLoader, DataLoader, int]:
     val_loader = DataLoader(val_set,
                             batch_size=B,
                             num_workers=5,
+                            worker_init_fn=worker_init_fn,
                             shuffle=False)
 
     args.dest.mkdir(parents=True, exist_ok=True)
@@ -383,8 +403,11 @@ def main():
     parser.add_argument('--augmentations', nargs='*', default=[],
                         help="List of data augmentation to use during training. "
                              "Available: HFlip, VFlip, Rotate, Affine.")
+    parser.add_argument('--seed', type=int, default=42, help="Random seed for reproducibility.")
 
     args = parser.parse_args()
+
+    set_seed(args.seed)
 
     pprint(args)
 
