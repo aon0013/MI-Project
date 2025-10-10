@@ -183,8 +183,15 @@ class ENet(nn.Module):
                 #                          BottleNeckUpSampling,
                 #                          conv_block)
 
-                # Initial operations
-                self.conv0 = nn.Conv2d(in_dim, K - 1, kernel_size=3, stride=2, padding=1)
+                # Initial operations (ALTRERED HERE normall we had to hastags only but i ADDED BELOW )
+                #self.conv0 = nn.Conv2d(in_dim, K - 1, kernel_size=3, stride=2, padding=1)
+                #self.maxpool0 = nn.MaxPool2d(2, return_indices=False, ceil_mode=False)
+                c_conv = K - in_dim
+                assert c_conv > 0, (
+                        f"ENet: kernels (K={K}) must be > in_dim ({in_dim}). "
+                        "Increase 'kernels' or reduce input channels."
+                )
+                self.conv0 = nn.Conv2d(in_dim, c_conv, kernel_size=3, stride=2, padding=1)
                 self.maxpool0 = nn.MaxPool2d(2, return_indices=False, ceil_mode=False)
 
                 # Downsampling half
