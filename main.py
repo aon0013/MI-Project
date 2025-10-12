@@ -135,6 +135,7 @@ def build_augmentations(args):
             augs.append(RandomAffine())
         elif t == 'elastic':
            augs.append(Elastic2D())
+            
         else:
             raise ValueError(f"Unknown augmentation: {t}")
     return augs
@@ -433,7 +434,7 @@ def main():
                     help="If set (1-based), train only this fold instead of all folds.")
     parser.add_argument('--augmentations', nargs='*', default=[],
                         help="List of data augmentation to use during training. "
-                             "Available: HFlip, VFlip, Rotate, Affine.")
+                             "Available: HFlip, VFlip, Rotate, Affine, Elastic.")
     parser.add_argument('--seed', type=int, default=42, help="Random seed for reproducibility.")
 
     parser.add_argument('--half_ctx', type=int, default=0,
