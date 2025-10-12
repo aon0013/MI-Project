@@ -58,7 +58,7 @@ from utils import (Dcm,
                    save_images)
 from losses import CrossEntropy
 
-from data_augmentation import HFlip, VFlip, Rotate, RandomAffine
+from data_augmentation import HFlip, VFlip, Rotate, RandomAffine, Elastic2D
 
 def _link_or_copy(src: Path, dst: Path) -> None:
     """Create a symlink if possible, else hardlink, else copy (Windows-safe)."""
@@ -133,6 +133,8 @@ def build_augmentations(args):
             augs.append(Rotate())
         elif t == 'affine':
             augs.append(RandomAffine())
+        elif t == 'elastic':
+           augs.append(Elastic2D())
         else:
             raise ValueError(f"Unknown augmentation: {t}")
     return augs

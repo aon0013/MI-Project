@@ -1,6 +1,9 @@
 from torchvision.transforms import functional as F
 from torchvision.transforms import InterpolationMode
 import random
+from PIL import Image
+import numpy as np
+import albumentations as A
 
 class HFlip:
     def __call__(self, img, mask):
@@ -72,3 +75,17 @@ class RandomAffine:
             interpolation=InterpolationMode.NEAREST, fill=self.fill_mask, center=self.center
         )
         return img_a, mask_a
+
+
+class Elastic2D:
+    def __init__(self, alpha=35, sigma=6, alpha_affine=6, p=1.0):
+        self.transform = A.Compose([A.ElasticTransform(alpha=alpha, sigma=sigma,
+                                                alpha_affine=alpha_affine,
+                                                interpolation=1,   
+                                                border_mode=0, p=p)])
+
+    def __call__(self, img, mask):
+        img  = np.array(img)
+        mask = np.array(mask)
+        out = self.transform(image=img, mask=mask)
+        return Image.fromarray(out["image"]), Image.fromarray(out["mask"])
