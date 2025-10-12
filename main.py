@@ -60,6 +60,22 @@ from losses import CrossEntropy
 
 from data_augmentation import HFlip, VFlip, Rotate, RandomAffine, Elastic2D
 
+def _link_or_copy(src: Path, dst: Path) -> None:
+    """Create a symlink if possible, else hardlink, else copy (Windows-safe)."""
+    if dst.exists():
+        return
+    try:
+        os.symlink(src, dst)         # works on Linux/macOS; on Win only with Dev Mode/admin
+        return
+    except (OSError, NotImplementedError):
+        pass
+    try:
+        os.link(src, dst)            # hardlink (NTFS), no admin needed
+        return
+    except OSError:
+        pass
+    shutil.copy2(src, dst)
+
 def set_seed(seed: int = 42):
     random.seed(seed)
     np.random.seed(seed)
@@ -82,11 +98,13 @@ datasets_params["SEGTHOR"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor
 datasets_params["SEGTHOR_CLEAN"] = {'K': 5, 'net': ENet, 'B': 8, 'kernels': 8, 'factor': 2}
 
 def img_transform(img):
+    # If the dataset hands us a (C,H,W) float tensor in [0,1] (2.5D path), keep it.
+    if isinstance(img, torch.Tensor):
+        return img
+    # Fallback for PIL inputs (old 2D behavior)
     img = img.convert('L')
-    img = np.array(img)[np.newaxis, ...]
-    img = img / 255  # max <= 1
-    img = torch.tensor(img, dtype=torch.float32)
-    return img
+    img = np.array(img, dtype=np.float32)[np.newaxis, ...] / 255.0
+    return torch.tensor(img, dtype=torch.float32)
 
 def gt_transform(K, img):
     img = np.array(img)[...]
@@ -116,7 +134,8 @@ def build_augmentations(args):
         elif t == 'affine':
             augs.append(RandomAffine())
         elif t == 'elastic':
-            augs.append(Elastic2D())
+           augs.append(Elastic2D())
+            
         else:
             raise ValueError(f"Unknown augmentation: {t}")
     return augs
@@ -166,23 +185,21 @@ def build_fold_dataset(fold_root: Path, train_ids, val_ids, base_img_dir: Path, 
         val_ids: list of patient IDs for validation
         base_img_dir, base_gt_dir: source directories with all img/gt PNGs
     """
-    # loop through train and val ids and create destination folders
+
     for subset, ids in [('train', train_ids), ('val', val_ids)]:
         for sub in ['img', 'gt']:
             dest_dir = fold_root / subset / sub
             dest_dir.mkdir(parents=True, exist_ok=True)
 
-            # get actual source directory for current subset
             src_dir = base_img_dir if sub == 'img' else base_gt_dir
 
-            # loop through pateint IDs and create symlinks for all their slices
+            # Each patient ID is like '01', '02', ...
+            # Files are named 'Patient_XX_####.png'
             for pid in ids:
-                pattern = re.compile(f"Patient_{pid}_\\d{{4}}\\.png")
-                for file in src_dir.iterdir():
-                    if pattern.match(file.name):
-                        target = dest_dir / file.name
-                        if not target.exists():
-                            os.symlink(file.resolve(), target)
+                pattern = f"Patient_{pid}_*.png"
+                for file in src_dir.glob(pattern):
+                    target = dest_dir / file.name
+                    _link_or_copy(file.resolve(), target)
 
 
 def setup(args) -> tuple[nn.Module, Any, Any, DataLoader, DataLoader, int]:
@@ -194,7 +211,18 @@ def setup(args) -> tuple[nn.Module, Any, Any, DataLoader, DataLoader, int]:
     K: int = datasets_params[args.dataset]['K']
     kernels: int = datasets_params[args.dataset]['kernels'] if 'kernels' in datasets_params[args.dataset] else 8
     factor: int = datasets_params[args.dataset]['factor'] if 'factor' in datasets_params[args.dataset] else 2
-    net = datasets_params[args.dataset]['net'](1, K, kernels=kernels, factor=factor)
+
+    
+
+    
+    in_ch = 2 * args.half_ctx + 1
+    NetClass = datasets_params[args.dataset]['net']
+    try:
+        net = NetClass(in_ch, K, kernels=kernels, factor=factor)
+    except TypeError:
+        net = NetClass(in_ch, K)
+
+    
     net.init_weights()
     net.to(device)
 
@@ -213,7 +241,8 @@ def setup(args) -> tuple[nn.Module, Any, Any, DataLoader, DataLoader, int]:
                              img_transform=img_transform,
                              gt_transform= partial(gt_transform, K),
                              augmentations=build_augmentations(args),
-                             debug=args.debug)
+                             debug=args.debug,
+                             half_ctx=args.half_ctx)
     train_loader = DataLoader(train_set,
                               batch_size=B,
                               num_workers=5,
@@ -224,7 +253,8 @@ def setup(args) -> tuple[nn.Module, Any, Any, DataLoader, DataLoader, int]:
                            root_dir,
                            img_transform=img_transform,
                            gt_transform=partial(gt_transform, K),
-                           debug=args.debug)
+                           debug=args.debug,
+                           half_ctx=args.half_ctx)
     val_loader = DataLoader(val_set,
                             batch_size=B,
                             num_workers=5,
@@ -354,7 +384,7 @@ def runTraining(args):
 
             current_dice = log_dice_val[e, :, 1:].mean().item()
             if current_dice > best_dice:
-                message = f">>> Fold {fold_idx + 1}: Improved Dice {best_dice:05.3f} → {current_dice:05.3f} (Epoch {e})"
+                message = f">>> Fold {fold_idx + 1}: Improved Dice {best_dice:05.3f} -> {current_dice:05.3f} (Epoch {e})"
                 print(message)
                 best_dice = current_dice
 
@@ -406,6 +436,9 @@ def main():
                         help="List of data augmentation to use during training. "
                              "Available: HFlip, VFlip, Rotate, Affine, Elastic.")
     parser.add_argument('--seed', type=int, default=42, help="Random seed for reproducibility.")
+
+    parser.add_argument('--half_ctx', type=int, default=0,
+    help='Neighbors per side for 2.5D (0=2D, 1→3ch, 2→5ch, …)')
 
     args = parser.parse_args()
 
