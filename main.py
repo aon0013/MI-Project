@@ -60,6 +60,31 @@ from losses import CrossEntropy
 
 from data_augmentation import HFlip, VFlip, Rotate, RandomAffine
 
+# -------------------- Optimizer Factory --------------------
+OPTIMIZER_CHOICES = ['adam', 'adamw', 'sgd', 'rmsprop', 'adagrad', 'adadelta']
+
+def build_optimizer(net: nn.Module, args) -> torch.optim.Optimizer:
+    name = getattr(args, 'optimizer', 'adam').lower()
+    lr = getattr(args, 'lr', 5e-4)
+    wd = getattr(args, 'weight_decay', 0.0)
+    if name == 'adam':
+        return torch.optim.Adam(net.parameters(), lr=lr, betas=(0.9, 0.999), weight_decay=wd)
+    elif name == 'adamw':
+        return torch.optim.AdamW(net.parameters(), lr=lr, betas=(0.9, 0.999), weight_decay=wd)
+    elif name == 'sgd':
+        momentum = getattr(args, 'momentum', 0.9)
+        return torch.optim.SGD(net.parameters(), lr=lr, momentum=momentum, weight_decay=wd, nesterov=True)
+    elif name == 'rmsprop':
+        momentum = getattr(args, 'momentum', 0.9)
+        alpha = getattr(args, 'rmsprop_alpha', 0.99)
+        return torch.optim.RMSprop(net.parameters(), lr=lr, momentum=momentum, alpha=alpha, weight_decay=wd)
+    elif name == 'adagrad':
+        return torch.optim.Adagrad(net.parameters(), lr=lr, weight_decay=wd)
+    elif name == 'adadelta':
+        return torch.optim.Adadelta(net.parameters(), lr=lr, weight_decay=wd)
+    else:
+        raise ValueError(f"Unknown optimizer: {name}")
+
 def set_seed(seed: int = 42):
     random.seed(seed)
     np.random.seed(seed)
@@ -196,8 +221,8 @@ def setup(args) -> tuple[nn.Module, Any, Any, DataLoader, DataLoader, int]:
     net.init_weights()
     net.to(device)
 
-    lr = 0.0005
-    optimizer = torch.optim.Adam(net.parameters(), lr=lr, betas=(0.9, 0.999))
+    # Optimizer
+    optimizer = build_optimizer(net, args)
 
     # Dataset part
     B: int = datasets_params[args.dataset]['B']
@@ -237,141 +262,154 @@ def setup(args) -> tuple[nn.Module, Any, Any, DataLoader, DataLoader, int]:
 def runTraining(args):
     print(f">>> Setting up {args.folds}-fold training on {args.dataset}")
 
-    # load consistent folds
-    root_dir = Path("data") / args.dataset
-    
-    # set base directories and get folds
+    # load consistent folds (built once and reused for each optimizer)
     base_img_dir = Path("data") / args.dataset / "img"
     base_gt_dir  = Path("data") / args.dataset / "gt"
     folds = create_or_load_folds_by_patient(base_img_dir, num_folds=args.folds, path=args.fold_path)
 
-    fold_results = []
+    summary = {}
 
-    # loop through folds
-    for fold_idx, (train_idx, val_idx) in enumerate(folds):
-        fold_num = fold_idx + 1
-        if args.fold_index is not None and fold_num != args.fold_index:
-            continue  # skip other folds
+    for opt_name in args.optimizers:
+        print(f"\n===================== Optimizer: {opt_name} =====================")
+        fold_results = []
 
-        print(f"\n===================== Fold {fold_idx + 1}/{args.folds} =====================")
+        # clone args and set optimizer-specific fields
+        opt_args = argparse.Namespace(**vars(args))
+        setattr(opt_args, 'optimizer', opt_name)
+        # results for this optimizer go under dest/opt_<name>
+        opt_dest = args.dest / f"opt_{opt_name}"
+        opt_dest.mkdir(parents=True, exist_ok=True)
 
-        # define directories for current fold and build dataset structure
-        fold_dest = args.dest / f"fold_{fold_idx + 1}"
-        fold_dest.mkdir(parents=True, exist_ok=True)
-        train_ids, val_ids = train_idx, val_idx
-        build_fold_dataset(fold_dest, train_ids, val_ids, base_img_dir, base_gt_dir)
+        # loop through folds
+        for fold_idx, (train_idx, val_idx) in enumerate(folds):
+            fold_num = fold_idx + 1
+            if args.fold_index is not None and fold_num != args.fold_index:
+                continue
 
-        # initialise for current fold
-        net, optimizer, device, train_loader, val_loader, K = setup(argparse.Namespace(**{**vars(args), "dest": fold_dest}))
+            print(f"\n--------------------- Fold {fold_num}/{args.folds} ---------------------")
 
-        # Choose loss
-        if args.mode == "full":
-            loss_fn = CrossEntropy(idk=list(range(K)))
-        elif args.mode == "partial" and args.dataset == 'SEGTHOR':
-            loss_fn = CrossEntropy(idk=[0, 1, 3, 4])
-        else:
-            raise ValueError(args.mode, args.dataset)
+            # define directories for current fold and build dataset structure
+            fold_dest = opt_dest / f"fold_{fold_num}"
+            fold_dest.mkdir(parents=True, exist_ok=True)
+            train_ids, val_ids = train_idx, val_idx
+            build_fold_dataset(fold_dest, train_ids, val_ids, base_img_dir, base_gt_dir)
 
-        # Notice one has the length of the _loader_, and the other one of the _dataset_
-        log_loss_tra = torch.zeros((args.epochs, len(train_loader)))
-        log_dice_tra = torch.zeros((args.epochs, len(train_loader.dataset), K))
-        log_loss_val = torch.zeros((args.epochs, len(val_loader)))
-        log_dice_val = torch.zeros((args.epochs, len(val_loader.dataset), K))
+            # initialise for current fold
+            net, optimizer, device, train_loader, val_loader, K = setup(argparse.Namespace(**{**vars(opt_args), "dest": fold_dest}))
 
-        best_dice: float = 0
+            # Choose loss
+            if args.mode == "full":
+                loss_fn = CrossEntropy(idk=list(range(K)))
+            elif args.mode == "partial" and args.dataset == 'SEGTHOR':
+                loss_fn = CrossEntropy(idk=[0, 1, 3, 4])
+            else:
+                raise ValueError(args.mode, args.dataset)
 
-        # Epoch loop
-        for e in range(args.epochs):
-            for mode in ['train', 'val']:
-                if mode == 'train':
-                    net.train()
-                    cm = Dcm
-                    opt = optimizer
-                    desc = f">> Training   (Epoch {e})"
-                    loader = train_loader
-                    log_loss, log_dice = log_loss_tra, log_dice_tra
-                else:
-                    net.eval()
-                    cm = torch.no_grad
-                    opt = None
-                    desc = f">> Validation (Epoch {e})"
-                    loader = val_loader
-                    log_loss, log_dice = log_loss_val, log_dice_val
+            # Notice one has the length of the _loader_, and the other one of the _dataset_
+            log_loss_tra = torch.zeros((args.epochs, len(train_loader)))
+            log_dice_tra = torch.zeros((args.epochs, len(train_loader.dataset), K))
+            log_loss_val = torch.zeros((args.epochs, len(val_loader)))
+            log_dice_val = torch.zeros((args.epochs, len(val_loader.dataset), K))
 
-                with cm(): # Either dummy context manager, or the torch.no_grad for validation
-                    j = 0
-                    tq_iter = tqdm_(enumerate(loader), total=len(loader), desc=desc)
-                    for i, data in tq_iter:
-                        img = data['images'].to(device)
-                        gt = data['gts'].to(device)
+            best_dice: float = 0
 
-                        if opt:  # So only for training
-                            opt.zero_grad()
+            # Epoch loop
+            for e in range(args.epochs):
+                for mode in ['train', 'val']:
+                    if mode == 'train':
+                        net.train()
+                        cm = Dcm
+                        opt = optimizer
+                        desc = f">> Training   (Epoch {e})"
+                        loader = train_loader
+                        log_loss, log_dice = log_loss_tra, log_dice_tra
+                    else:
+                        net.eval()
+                        cm = torch.no_grad
+                        opt = None
+                        desc = f">> Validation (Epoch {e})"
+                        loader = val_loader
+                        log_loss, log_dice = log_loss_val, log_dice_val
 
-                        # Sanity tests to see we loaded and encoded the data correctly
-                        assert 0 <= img.min() and img.max() <= 1
-                        B, _, W, H = img.shape
+                    with cm():
+                        j = 0
+                        tq_iter = tqdm_(enumerate(loader), total=len(loader), desc=desc)
+                        for i, data in tq_iter:
+                            img = data['images'].to(device)
+                            gt = data['gts'].to(device)
 
-                        pred_logits = net(img)
-                        pred_probs = F.softmax(1 * pred_logits, dim=1)  # 1 is the temperature parameter
+                            if opt:
+                                opt.zero_grad()
 
-                        # Metrics computation, not used for training
-                        pred_seg = probs2one_hot(pred_probs)
-                        log_dice[e, j:j + img.shape[0], :] = dice_coef(pred_seg, gt)  # One DSC value per sample and per class
+                            assert 0 <= img.min() and img.max() <= 1
+                            B, _, W, H = img.shape
 
-                        loss = loss_fn(pred_probs, gt)
-                        log_loss[e, i] = loss.item()  # One loss value per batch (averaged in the loss)
+                            pred_logits = net(img)
+                            pred_probs = F.softmax(1 * pred_logits, dim=1)
 
-                        if opt:  # Only for training
-                            loss.backward()
-                            opt.step()
+                            pred_seg = probs2one_hot(pred_probs)
+                            log_dice[e, j:j + img.shape[0], :] = dice_coef(pred_seg, gt)
 
-                        if mode == 'val':
-                            with warnings.catch_warnings():
-                                warnings.filterwarnings('ignore', category=UserWarning)
-                                predicted_class: Tensor = probs2class(pred_probs)
-                                mult: int = 63 if K == 5 else (255 / (K - 1))
-                                save_images(predicted_class * mult,
-                                            data['stems'],
-                                            fold_dest / f"iter{e:03d}" / mode)
+                            loss = loss_fn(pred_probs, gt)
+                            log_loss[e, i] = loss.item()
 
-                        # changed B to img.shape[0] here and above to be safe if last batch if smaller than B
-                        j += img.shape[0]
-                        # Removed the printing of each dice score 
-                        # For the DSC average: do not take the background class (0) into account:
-                        tq_iter.set_postfix({
-                            "Dice": f"{log_dice[e, :j, 1:].mean():05.3f}",
-                            "Loss": f"{log_loss[e, :i + 1].mean():5.2e}"
-                        })
+                            if opt:
+                                loss.backward()
+                                opt.step()
 
-            # I save it at each epochs, in case the code crashes or I decide to stop it early
-            np.save(fold_dest / "loss_tra.npy", log_loss_tra)
-            np.save(fold_dest / "dice_tra.npy", log_dice_tra)
-            np.save(fold_dest / "loss_val.npy", log_loss_val)
-            np.save(fold_dest / "dice_val.npy", log_dice_val)
+                            if mode == 'val':
+                                with warnings.catch_warnings():
+                                    warnings.filterwarnings('ignore', category=UserWarning)
+                                    predicted_class: Tensor = probs2class(pred_probs)
+                                    mult: int = 63 if K == 5 else (255 / (K - 1))
+                                    save_images(predicted_class * mult,
+                                                data['stems'],
+                                                fold_dest / f"iter{e:03d}" / mode)
 
-            current_dice = log_dice_val[e, :, 1:].mean().item()
-            if current_dice > best_dice:
-                message = f">>> Fold {fold_idx + 1}: Improved Dice {best_dice:05.3f} → {current_dice:05.3f} (Epoch {e})"
-                print(message)
-                best_dice = current_dice
+                            j += img.shape[0]
+                            tq_iter.set_postfix({
+                                "Dice": f"{log_dice[e, :j, 1:].mean():05.3f}",
+                                "Loss": f"{log_loss[e, :i + 1].mean():5.2e}"
+                            })
 
-                with open(fold_dest / "best_epoch.txt", 'w') as f:
-                    f.write(message)
+                np.save(fold_dest / "loss_tra.npy", log_loss_tra)
+                np.save(fold_dest / "dice_tra.npy", log_dice_tra)
+                np.save(fold_dest / "loss_val.npy", log_loss_val)
+                np.save(fold_dest / "dice_val.npy", log_dice_val)
 
-                best_folder = fold_dest / "best_epoch"
-                if best_folder.exists():
-                    rmtree(best_folder)
-                copytree(fold_dest / f"iter{e:03d}", best_folder)
+                current_dice = log_dice_val[e, :, 1:].mean().item()
+                if current_dice > best_dice:
+                    message = f">>> Fold {fold_num}: Improved Dice {best_dice:05.3f} → {current_dice:05.3f} (Epoch {e})"
+                    print(message)
+                    best_dice = current_dice
 
-                torch.save(net, fold_dest / "bestmodel.pkl")
-                torch.save(net.state_dict(), fold_dest / "bestweights.pt")
+                    with open(fold_dest / "best_epoch.txt", 'w') as f:
+                        f.write(message)
 
-                print(f">> Saved best predictions to {best_folder}")
+                    best_folder = fold_dest / "best_epoch"
+                    if best_folder.exists():
+                        rmtree(best_folder)
+                    copytree(fold_dest / f"iter{e:03d}", best_folder)
 
-        fold_results.append(best_dice)
+                    torch.save(net, fold_dest / "bestmodel.pkl")
+                    torch.save(net.state_dict(), fold_dest / "bestweights.pt")
 
-    print(f"\n>> Average Dice across folds: {np.mean(fold_results):.4f} ± {np.std(fold_results):.4f}")
+                    print(f">> Saved best predictions to {best_folder}")
+
+            fold_results.append(best_dice)
+
+        # summarize for this optimizer
+        if fold_results:
+            avg = float(np.mean(fold_results))
+            std = float(np.std(fold_results))
+            summary[opt_name] = {"mean_dice": avg, "std_dice": std}
+            print(f"\n>> {opt_name}: Average Dice across folds: {avg:.4f} ± {std:.4f}")
+
+    # final comparison table
+    if summary:
+        print("\n===================== Optimizer Comparison =====================")
+        for k, v in summary.items():
+            print(f"{k:>10}: {v['mean_dice']:.4f} ± {v['std_dice']:.4f}")
 
 
 # -------------------- Main --------------------
@@ -405,6 +443,14 @@ def main():
                              "Available: HFlip, VFlip, Rotate, Affine.")
     parser.add_argument('--seed', type=int, default=42, help="Random seed for reproducibility.")
 
+    # Optimizer selection & hyperparameters
+    parser.add_argument('--optimizers', nargs='+', default=['adam'], choices=OPTIMIZER_CHOICES,
+                        help='One or more optimizers to evaluate. Results will be saved under dest/opt_<name>.')
+    parser.add_argument('--lr', type=float, default=5e-4, help='Base learning rate for the optimizer(s).')
+    parser.add_argument('--momentum', type=float, default=0.9, help='Momentum for SGD/RMSprop.')
+    parser.add_argument('--weight_decay', type=float, default=0.0, help='Weight decay (L2).')
+    parser.add_argument('--rmsprop_alpha', type=float, default=0.99, help='Smoothing constant for RMSprop.')
+
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -416,3 +462,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
