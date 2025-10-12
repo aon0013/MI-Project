@@ -1,131 +1,138 @@
-#!/usr/bin/env python3.10
-
-# MIT License
-
-# Copyright (c) 2024 Hoel Kervadec
-
-# Permission is hereby granted, free of charge, to any person obtaining a copy
-# of this software and associated documentation files (the "Software"), to deal
-# in the Software without restriction, including without limitation the rights
-# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-# copies of the Software, and to permit persons to whom the Software is
-# furnished to do so, subject to the following conditions:
-
-# The above copyright notice and this permission notice shall be included in all
-# copies or substantial portions of the Software.
-
-# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-# SOFTWARE.
-
-import re
 import argparse
-from itertools import repeat
 from pathlib import Path
-from typing import Match, Pattern
+from functools import partial
+from typing import Callable
+from utils import tqdm_
 
-import numpy as np
 import nibabel as nib
-from skimage.io import imread
+import numpy as np
+import re
+import skimage.io
 from skimage.transform import resize
 
-from utils import map_, tqdm_
+from scipy.ndimage import binary_fill_holes, binary_opening, binary_closing
+from skimage import measure
+
+resize_: Callable = partial(resize, mode="constant", preserve_range=True, anti_aliasing=False)
+
+# Post-processing functions
+def keep_largest_volume(mask: np.ndarray) -> np.ndarray:
+    labels = measure.label(mask)
+    if labels.max() == 0:
+        return mask
+    largest_label = np.argmax(np.bincount(labels.flat)[1:]) + 1
+    return (labels == largest_label).astype(np.uint8)
+
+def smooth_mask(mask: np.ndarray, structure_size: int=3) -> np.ndarray:
+    structure = np.ones((structure_size,) * mask.ndim, dtype=bool)
+    mask = binary_opening(mask, structure=structure)
+    mask = binary_closing(mask, structure=structure)
+    return mask.astype(np.uint8)
+
+def post_process(volume: np.ndarray) -> np.ndarray:
+    processed = np.zeros_like(volume)
+    heart, aorta, trachea, esophagus = 1, 2, 3, 4
+
+    for organ in [heart, aorta, trachea, esophagus]:
+        organ_mask = (volume == organ).astype(np.uint8)
+
+        if organ in [aorta]:
+            organ_mask = keep_largest_volume(organ_mask)
+
+        if organ in [aorta, trachea, esophagus]:
+            organ_mask = smooth_mask(organ_mask, structure_size=2)
+
+        if organ in [aorta]:
+            organ_mask = binary_fill_holes(organ_mask)
+
+        processed[(organ_mask > 0) & (processed == 0)] = organ
+
+    processed[volume == heart] = heart
+
+    return processed
+
+def store_nifti(volume, dest_path, header=None, affine=None):
+    nifti_img = nib.Nifti1Image(volume, affine=np.diag([1, 1, 1, 1]) if affine is None else affine,
+                                header=header)
+
+    nib.save(nifti_img, dest_path)
 
 
-def get_z(image: Path) -> int:
-    return int(image.stem.split('_')[-1])
+def stitch_slices(data_folder, dest_folder, num_classes, grp_regex, source_scan_pattern, postprocess=True):
+    patient_regex = re.compile(grp_regex)
+
+    id_set = set()
+    source_shapes = dict()
+    stitched_volumes = dict()
+    headers = dict()
+    affines = dict()
+
+    px_multiplier = int(255 / (num_classes - 1))
+
+    for pred_slice in tqdm_(data_folder.iterdir(), desc="Processing slices"):
+        match = patient_regex.fullmatch(pred_slice.stem)
+
+        if pred_slice.is_file():
+            # Extract patient ID from the match
+            patient_id = match.group(1)
+            image_id = int(match.group(0).split('_')[-1])
+
+            if patient_id not in id_set:
+                id_set.add(patient_id)
+                pattern_path = source_scan_pattern.format(id_=patient_id)
+                source_volume = nib.load(pattern_path)
+                source_shapes[patient_id] = source_volume.shape
+                headers[patient_id] = source_volume.header
+                affines[patient_id] = source_volume.affine
+                stitched_volumes[patient_id] = np.zeros(source_shapes[patient_id], dtype=np.uint8)
+
+            # Load the png slice image as a numpy array
+            slice_img = skimage.io.imread(pred_slice)
+            slice_img = (slice_img / px_multiplier).astype(np.uint8)
+
+            stitched_volumes[patient_id][:, :, image_id] = resize_(slice_img, source_shapes[patient_id][:2], 
+                                                                   order=0).astype(np.uint8)
+
+    dest_folder.mkdir(parents=True, exist_ok=True)
+
+    for patient_id, volume in stitched_volumes.items():
+        if postprocess:
+            volume = post_process(volume)
+        dest_path = dest_folder / f"{patient_id}.nii.gz"
+        store_nifti(volume, dest_path, header=headers[patient_id], affine=affines[patient_id])
+
+    print(f"Stitched and post-processed for patients: {id_set}")
+    print(f"Stitched volumes saved to {dest_folder}")
 
 
-def merge_patient(id_: str, dest_folder: str, images: list[Path],
-                  idxes: list[int], K: int, source_pattern: str) -> None:
-    # print(source_pattern.format(id_=id_))
-    orig_nib = nib.load(source_pattern.format(id_=id_))
-    orig_shape = np.asarray(orig_nib.dataobj).shape
-    # print(orig_nib.affine)
+def main(args):
+    data_folder = Path(args.data_folder)
+    dest_folder = Path(args.dest_folder)
+    num_classes = args.num_classes
+    grp_regex = args.grp_regex
+    source_scan_pattern = args.source_scan_pattern
 
-    X, Y, Z = orig_shape
-    assert Z == len(idxes)
+    assert data_folder.exists()
 
-    res_arr: np.ndarray = np.zeros((X, Y, Z), dtype=np.int16)
-
-    for idx in idxes:
-        img: Path = images[idx]
-
-        z = get_z(img)
-        img_arr = imread(img)
-        assert img_arr.dtype == np.uint8
-        assert set(np.unique(img_arr)) <= set(range(K))
-
-        resized: np.ndarray = resize(img_arr, (X, Y),
-                                     mode="constant",
-                                     preserve_range=True,
-                                     anti_aliasing=False,
-                                     order=0)
-
-        res_arr[:, :, z] = resized[...]
-
-    assert set(np.unique(res_arr)) <= set(range(K))
-    assert orig_shape == res_arr.shape, (orig_shape, res_arr.shape)
-
-    # res_arr = res_arr.astype(np.int16)
-    res_arr //= 63  # For segthor only
-    assert set(np.unique(res_arr)) == set(range(5)), np.uint8(res_arr)
-
-    new_nib = nib.nifti1.Nifti1Image(res_arr, affine=orig_nib.affine, header=orig_nib.header)
-    nib.save(new_nib, (Path(dest_folder) / id_).with_suffix(".nii.gz"))
+    stitch_slices(data_folder, dest_folder, num_classes, grp_regex, source_scan_pattern, postprocess=True)
 
 
-def main(args) -> None:
-    images: list[Path] = list(Path(args.data_folder).glob("*.png"))
-    grouping_regex: Pattern = re.compile(args.grp_regex)
+def get_args():
+    parser = argparse.ArgumentParser(description='Stitching and post-processing parameters')
 
-    stems: list[str] = map_(lambda p: p.stem, images)
-
-    matches: list[Match] = map_(grouping_regex.match, stems)  # type: ignore
-    patients: list[str] = [match.group(1) for match in matches]
-    unique_patients: list[str] = list(set(patients))
-    print(unique_patients)
-    assert len(unique_patients) < len(images)
-    print(f"Found {len(unique_patients)} unique patients out of {len(images)} images ; regex: {args.grp_regex}")
-
-    idx_map: dict[str, list[int]] = dict(zip(unique_patients, repeat(None)))  # type: ignore
-    for i, patient in enumerate(patients):
-        if not idx_map[patient]:
-            idx_map[patient] = []
-
-        idx_map[patient] += [i]
-
-    # print(idx_map)
-    assert sum(len(idx_map[k]) for k in unique_patients) == len(images)
-
-    args.dest_folder.mkdir(parents=True, exist_ok=True)
-
-    for p in tqdm_(unique_patients):
-        merge_patient(p, args.dest_folder, images, idx_map[p], args.num_classes, args.source_scan_pattern)
-    # mmap_(lambda p: merge_patient(p, args.dest_folder, images, idx_map[p], K=args.num_classes), patients)
-
-
-def get_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description='Merging slices parameters')
-    parser.add_argument('--data_folder', type=Path, required=True,
-                        help="The folder containing the images to predict")
-    parser.add_argument('--source_scan_pattern', type=str, required=True,
-                        help="The pattern to get the original scan. This is used to get the correct metadata")
-    parser.add_argument('--dest_folder', type=Path, required=True)
-    parser.add_argument('--grp_regex', type=str, required=True)
-
-    parser.add_argument('--num_classes', type=int, default=4)
+    parser.add_argument('--data_folder', type=str, required=True)
+    parser.add_argument('--dest_folder', type=str, required=True)
+    parser.add_argument('--num_classes', type=int, required=True)
+    parser.add_argument('--grp_regex', type=str, required=True, default=r"(Patient_\d\d)_\d\d\d\d")
+    parser.add_argument('--source_scan_pattern', type=str, required=True)
 
     args = parser.parse_args()
-
     print(args)
 
     return args
 
 
 if __name__ == "__main__":
-    main(get_args())
+    args = get_args()
+    main(args)
+
