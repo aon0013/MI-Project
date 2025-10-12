@@ -58,7 +58,7 @@ from utils import (Dcm,
                    save_images)
 from losses import CrossEntropy
 
-from data_augmentation import HFlip, VFlip, Rotate, RandomAffine
+from data_augmentation import HFlip, VFlip, Rotate, RandomAffine, Elastic2D
 
 def set_seed(seed: int = 42):
     random.seed(seed)
@@ -115,6 +115,8 @@ def build_augmentations(args):
             augs.append(Rotate())
         elif t == 'affine':
             augs.append(RandomAffine())
+        elif t == 'elastic':
+            augs.append(Elastic2D())
         else:
             raise ValueError(f"Unknown augmentation: {t}")
     return augs
@@ -402,7 +404,7 @@ def main():
                     help="If set (1-based), train only this fold instead of all folds.")
     parser.add_argument('--augmentations', nargs='*', default=[],
                         help="List of data augmentation to use during training. "
-                             "Available: HFlip, VFlip, Rotate, Affine.")
+                             "Available: HFlip, VFlip, Rotate, Affine, Elastic.")
     parser.add_argument('--seed', type=int, default=42, help="Random seed for reproducibility.")
 
     args = parser.parse_args()
