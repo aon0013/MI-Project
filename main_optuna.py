@@ -65,7 +65,7 @@ from losses import CrossEntropy
 
 from data_augmentation import HFlip, VFlip, Rotate, RandomAffine
 
-# -------------------- Optimizer: AdamW only --------------------
+# Optimizer: AdamW 
 OPTIMIZER_CHOICES = ["adamw"]
 
 
@@ -95,7 +95,7 @@ def worker_init_fn(worker_id):
     random.seed(seed)
 
 
-# -------------------- Dataset Registry --------------------
+
 datasets_params: dict[str, dict[str, Any]] = {}
 # K for the number of classes
 # Avoids the classes with C (often used for the number of Channel)
