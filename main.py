@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 
 # MIT License
-
 # Copyright (c) 2025 Hoel Kervadec, Caroline Magg
 
 # Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -34,7 +33,6 @@ import os
 import shutil
 import re
 
-
 import random
 import torch
 import numpy as np
@@ -45,6 +43,13 @@ from torch.utils.data import DataLoader, Subset
 from sklearn.model_selection import KFold
 
 from functools import partial
+
+try:
+    import optuna
+    from optuna.samplers import TPESampler
+    from optuna.pruners import MedianPruner
+except Exception:
+    optuna = None
 
 from dataset import SliceDataset
 from ShallowNet import shallowCNN
@@ -88,7 +93,7 @@ def set_seed(seed: int = 42):
 def worker_init_fn(worker_id):
     seed = torch.initial_seed() % 2**32
     np.random.seed(seed)
-    random.seed(seed)  
+    random.seed(seed)
 
 datasets_params: dict[str, dict[str, Any]] = {}
 # K for the number of classes
@@ -117,7 +122,6 @@ def gt_transform(K, img):
     img = class2one_hot(img, K=K)
     return img[0]
 
-
 # -------------------- Data Augmentation --------------------
 def build_augmentations(args):
     norm = lambda s: s.lower()
@@ -135,25 +139,23 @@ def build_augmentations(args):
             augs.append(RandomAffine())
         elif t == 'elastic':
            augs.append(Elastic2D())
-            
         else:
             raise ValueError(f"Unknown augmentation: {t}")
     return augs
 
-
 # -------------------- add K-Fold splits --------------------
 def create_or_load_folds_by_patient(img_dir, num_folds=5, seed=42, path=None):
     """
-    This fumnction loads in pre-sorted K-fold splits based on patient IDs, or 
+    This fumnction loads in pre-sorted K-fold splits based on patient IDs, or
     creates the folds if not yet created. Each fold contains unique patients.
     """
     # construct file name automatically if directory is passed
-    path = Path(path)
-    if path.is_dir():
+    path = Path(path) if path is not None else None
+    if path is not None and path.is_dir():
         path = path / f"{num_folds}_folds.pkl"
 
     # if no path is given create path name
-    elif path is None:
+    if path is None:
         path = Path(f"data/{num_folds}_folds.pkl")
 
     patient_ids = sorted({f.name.split('_')[1] for f in img_dir.glob("Patient_*_*.png")})
@@ -169,10 +171,10 @@ def create_or_load_folds_by_patient(img_dir, num_folds=5, seed=42, path=None):
         indices = np.arange(len(patient_ids))
         folds = [( [patient_ids[i] for i in train_idx],
                    [patient_ids[i] for i in val_idx]) for train_idx, val_idx in kf.split(indices)]
+        path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "wb") as f:
             pickle.dump(folds, f)
     return folds
-
 
 # --- build per-fold train/val folders to remain consistent with expected input to dataset.py ---
 def build_fold_dataset(fold_root: Path, train_ids, val_ids, base_img_dir: Path, base_gt_dir: Path):
@@ -201,7 +203,6 @@ def build_fold_dataset(fold_root: Path, train_ids, val_ids, base_img_dir: Path, 
                     target = dest_dir / file.name
                     _link_or_copy(file.resolve(), target)
 
-
 def setup(args) -> tuple[nn.Module, Any, Any, DataLoader, DataLoader, int]:
     # Networks and scheduler
     gpu: bool = args.gpu and torch.cuda.is_available()
@@ -212,9 +213,6 @@ def setup(args) -> tuple[nn.Module, Any, Any, DataLoader, DataLoader, int]:
     kernels: int = datasets_params[args.dataset]['kernels'] if 'kernels' in datasets_params[args.dataset] else 8
     factor: int = datasets_params[args.dataset]['factor'] if 'factor' in datasets_params[args.dataset] else 2
 
-    
-
-    
     in_ch = 2 * args.half_ctx + 1
     NetClass = datasets_params[args.dataset]['net']
     try:
@@ -222,12 +220,17 @@ def setup(args) -> tuple[nn.Module, Any, Any, DataLoader, DataLoader, int]:
     except TypeError:
         net = NetClass(in_ch, K)
 
-    
     net.init_weights()
     net.to(device)
 
-    lr = 0.0005
-    optimizer = torch.optim.Adam(net.parameters(), lr=lr, betas=(0.9, 0.999))
+    # AdamW 
+    optimizer = torch.optim.AdamW(
+        net.parameters(),
+        lr=args.lr,
+        betas=(args.beta1, args.beta2),
+        eps=args.eps,
+        weight_decay=args.weight_decay
+    )
 
     # Dataset part
     B: int = datasets_params[args.dataset]['B']
@@ -265,13 +268,12 @@ def setup(args) -> tuple[nn.Module, Any, Any, DataLoader, DataLoader, int]:
 
     return net, optimizer, device, train_loader, val_loader, K
 
-
 def runTraining(args):
     print(f">>> Setting up {args.folds}-fold training on {args.dataset}")
 
     # load consistent folds
     root_dir = Path("data") / args.dataset
-    
+
     # set base directories and get folds
     base_img_dir = Path("data") / args.dataset / "img"
     base_gt_dir  = Path("data") / args.dataset / "gt"
@@ -369,7 +371,7 @@ def runTraining(args):
 
                         # changed B to img.shape[0] here and above to be safe if last batch if smaller than B
                         j += img.shape[0]
-                        # Removed the printing of each dice score 
+                        # Removed the printing of each dice score
                         # For the DSC average: do not take the background class (0) into account:
                         tq_iter.set_postfix({
                             "Dice": f"{log_dice[e, :j, 1:].mean():05.3f}",
@@ -405,6 +407,137 @@ def runTraining(args):
 
     print(f"\n>> Average Dice across folds: {np.mean(fold_results):.4f} ± {np.std(fold_results):.4f}")
 
+# optuna tuning 
+def _optuna_objective(args, folds, base_img_dir: Path, base_gt_dir: Path):
+    def objective(trial):
+        lr = trial.suggest_float('lr', args.lr_min, args.lr_max, log=True)
+        weight_decay = trial.suggest_float('weight_decay', 1e-6, 1e-2, log=True)
+        beta1 = trial.suggest_float('beta1', 0.85, 0.99)
+        beta2 = trial.suggest_float('beta2', 0.95, 0.9999)
+        eps   = trial.suggest_float('eps', 1e-9, 1e-7, log=True)
+        scheduler = trial.suggest_categorical('scheduler', [None, 'cosine', 'plateau'])
+
+        fold_scores = []
+        for fold_idx, (train_ids, val_ids) in enumerate(folds):
+            if args.max_folds_in_tune and fold_idx >= args.max_folds_in_tune:
+                break
+
+            fold_dest = args.dest / f"trial_{trial.number:04d}" / f"fold_{fold_idx+1}"
+            fold_dest.mkdir(parents=True, exist_ok=True)
+            build_fold_dataset(fold_dest, train_ids, val_ids, base_img_dir, base_gt_dir)
+
+            local = argparse.Namespace(**{
+                **vars(args),
+                "dest": fold_dest,
+                "lr": lr,
+                "weight_decay": weight_decay,
+                "beta1": beta1,
+                "beta2": beta2,
+                "eps": eps
+            })
+
+            net, optimizer, device, train_loader, val_loader, K = setup(local)
+            loss_fn = CrossEntropy(idk=list(range(K)))
+
+            if scheduler == "cosine":
+                sched = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, args.tune_epochs))
+            elif scheduler == "plateau":
+                sched = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", patience=2, factor=0.5)
+            else:
+                sched = None
+
+            best = 0.0
+            for e in range(args.tune_epochs):
+                # train
+                net.train()
+                for i, data in tqdm_(enumerate(train_loader), total=len(train_loader), desc=f">> Train (E{e})"):
+                    img, gt = data['images'].to(device), data['gts'].to(device)
+                    optimizer.zero_grad(set_to_none=True)
+                    logits = net(img)
+                    probs = torch.softmax(logits, dim=1)
+                    loss = loss_fn(probs, gt)
+                    loss.backward()
+                    optimizer.step()
+
+                # validate
+                net.eval()
+                vals = []
+                with torch.no_grad():
+                    for i, data in tqdm_(enumerate(val_loader), total=len(val_loader), desc=f">> Val   (E{e})"):
+                        img, gt = data['images'].to(device), data['gts'].to(device)
+                        logits = net(img)
+                        probs = torch.softmax(logits, dim=1)
+                        hard = probs2one_hot(probs)
+                        d = dice_coef(hard, gt)
+                        if d.dim() == 2:
+                            d = d.mean(dim=0)
+                        if args.ignore_bg_in_val and d.numel() > 1:
+                            vals.append(d[1:].mean().item())
+                        else:
+                            vals.append(d.mean().item())
+
+                score = float(np.mean(vals)) if vals else 0.0
+                if sched is not None:
+                    if isinstance(sched, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                        sched.step(score)
+                    else:
+                        sched.step()
+
+                trial.report(score, step=e)
+                if trial.should_prune():
+                    raise optuna.TrialPruned()
+
+                best = max(best, score)
+
+            fold_scores.append(best)
+
+        return float(np.mean(fold_scores)) if fold_scores else 0.0
+    return objective
+
+def tune_hyperparams(args):
+    if optuna is None:
+        raise RuntimeError("Optuna is not installed or failed to import. Install with `pip install optuna`.")
+
+    base_img_dir = Path("data") / args.dataset / "img"
+    base_gt_dir  = Path("data") / args.dataset / "gt"
+    folds = create_or_load_folds_by_patient(base_img_dir, num_folds=args.folds, path=args.fold_path)
+
+    sampler = TPESampler(seed=args.seed)
+    pruner = MedianPruner(n_startup_trials=3) if args.use_pruner else None
+    study = optuna.create_study(direction='maximize', sampler=sampler, pruner=pruner)
+
+    study.optimize(_optuna_objective(args, folds, base_img_dir, base_gt_dir),
+                   n_trials=args.n_trials, timeout=args.timeout)
+
+    results_dir = Path.home() / "MIProject" / "results"
+    results_dir.mkdir(parents=True, exist_ok=True)
+
+    best_params_path = results_dir / "best_params_optuna_adamw.pkl"
+    with open(best_params_path, "wb") as f:
+        pickle.dump(study.best_params, f)
+
+    best_txt_path = results_dir / "best_trial_info_adamw.txt"
+    with open(best_txt_path, "w") as f:
+        f.write(f"Best value (mean Dice): {study.best_value:.6f}\nBest parameters:\n")
+        for k, v in study.best_params.items():
+            f.write(f"  {k}: {v}\n")
+        f.write(f"\nTrials finished: {len(study.trials)}\n")
+
+    trials_csv_path = results_dir / "optuna_all_trials_adamw.csv"
+    df = study.trials_dataframe(attrs=("number", "value", "params", "state"))
+    df.to_csv(trials_csv_path, index=False)
+
+    trials_json_path = results_dir / "optuna_all_trials_adamw.json"
+    import json
+    with open(trials_json_path, "w") as f:
+        json.dump([t.params | {"value": t.value, "state": t.state.name} for t in study.trials], f, indent=2)
+
+    print("\n=== Optuna Results Saved ===")
+    print(f"Best params (pickle): {best_params_path}")
+    print(f"Summary text:          {best_txt_path}")
+    print(f"All trials CSV:        {trials_csv_path}")
+    print(f"All trials JSON:       {trials_json_path}")
+    print("============================\n")
 
 # -------------------- Main --------------------
 def main():
@@ -428,17 +561,39 @@ def main():
 
     parser.add_argument('--folds', type=int, default=5)
     parser.add_argument('--fold_path', type=str, default='data',
-    help="Path or directory to load/save the folds file. "
-         "If a directory is given, the file will be named {num_folds}_folds.pkl.")
+                        help="Path or directory to load/save the folds file. "
+                             "If a directory is given, the file will be named {num_folds}_folds.pkl.")
     parser.add_argument('--fold_index', type=int, default=None,
-                    help="If set (1-based), train only this fold instead of all folds.")
+                        help="If set (1-based), train only this fold instead of all folds.")
     parser.add_argument('--augmentations', nargs='*', default=[],
                         help="List of data augmentation to use during training. "
                              "Available: HFlip, VFlip, Rotate, Affine, Elastic.")
     parser.add_argument('--seed', type=int, default=42, help="Random seed for reproducibility.")
 
     parser.add_argument('--half_ctx', type=int, default=0,
-    help='Neighbors per side for 2.5D (0=2D, 1→3ch, 2→5ch, …)')
+                        help='Neighbors per side for 2.5D (0=2D, 1→3ch, 2→5ch, …)')
+
+    # AdamW params 
+    parser.add_argument('--lr', type=float, default=0.00041917115166952007)
+    parser.add_argument('--weight_decay', type=float, default=0.0006796578090758161)
+    parser.add_argument('--beta1', type=float, default=0.8528818292014123)
+    parser.add_argument('--beta2', type=float, default=0.9983985016228836)
+    parser.add_argument('--eps', type=float, default=4.622589001020826e-08)
+
+    # Validation behavior
+    parser.add_argument('--ignore_bg_in_val', action='store_true',
+                        help='Average Dice over classes 1..K-1 on validation')
+
+    # Optuna tuning switches
+    parser.add_argument('--tune', action='store_true')
+    parser.add_argument('--n_trials', type=int, default=25)
+    parser.add_argument('--tune_epochs', type=int, default=8)
+    parser.add_argument('--max_folds_in_tune', type=int, default=1)
+    parser.add_argument('--timeout', type=int, default=None)
+    parser.add_argument('--use_pruner', action='store_true')
+    parser.add_argument('--lr_min', type=float, default=1e-5)
+    parser.add_argument('--lr_max', type=float, default=5e-3)
+    parser.add_argument('--scheduler', type=str, default=None, choices=[None, 'cosine', 'plateau'])
 
     args = parser.parse_args()
 
@@ -446,8 +601,10 @@ def main():
 
     pprint(args)
 
-    runTraining(args)
-
+    if args.tune:
+        tune_hyperparams(args)
+    else:
+        runTraining(args)
 
 if __name__ == '__main__':
     main()
