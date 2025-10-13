@@ -31,23 +31,23 @@ def smooth_mask(mask: np.ndarray, structure_size: int=3) -> np.ndarray:
 
 def post_process(volume: np.ndarray) -> np.ndarray:
     processed = np.zeros_like(volume)
-    heart, aorta, trachea, esophagus = 1, 2, 3, 4
+    esophagus, heart, trachea, aorta = 1, 2, 3, 4
 
-    for organ in [heart, aorta, trachea, esophagus]:
+    for organ in [esophagus, heart, trachea, aorta]:
         organ_mask = (volume == organ).astype(np.uint8)
 
-        if organ in [aorta]:
+        if organ in [heart]:
             organ_mask = keep_largest_volume(organ_mask)
 
-        if organ in [aorta, trachea, esophagus]:
+        if organ in [heart, trachea, aorta]:
             organ_mask = smooth_mask(organ_mask, structure_size=2)
 
-        if organ in [aorta]:
+        if organ in [heart]:
             organ_mask = binary_fill_holes(organ_mask)
 
         processed[(organ_mask > 0) & (processed == 0)] = organ
 
-    processed[volume == heart] = heart
+    processed[volume == esophagus] = esophagus
 
     return processed
 
