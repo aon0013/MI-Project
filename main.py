@@ -574,11 +574,11 @@ def main():
                         help='Neighbors per side for 2.5D (0=2D, 1→3ch, 2→5ch, …)')
 
     # AdamW params 
-    parser.add_argument('--lr', type=float, default=5e-4)
-    parser.add_argument('--weight_decay', type=float, default=1e-2)
-    parser.add_argument('--beta1', type=float, default=0.9)
-    parser.add_argument('--beta2', type=float, default=0.999)
-    parser.add_argument('--eps', type=float, default=1e-8)
+    parser.add_argument('--lr', type=float, default=0.00041917115166952007)
+    parser.add_argument('--weight_decay', type=float, default=0.0006796578090758161)
+    parser.add_argument('--beta1', type=float, default=0.8528818292014123)
+    parser.add_argument('--beta2', type=float, default=0.9983985016228836)
+    parser.add_argument('--eps', type=float, default=4.622589001020826e-08)
 
     # Validation behavior
     parser.add_argument('--ignore_bg_in_val', action='store_true',
